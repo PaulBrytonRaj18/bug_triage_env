@@ -1,0 +1,150 @@
+# bug_triage_env/openenv.yaml
+#
+# OpenEnv specification metadata file.
+# Required for openenv validate to pass.
+# Required for HuggingFace Space tagging.
+
+name: bug-triage-env
+version: "1.0.0"
+description: >
+  A GitHub issue triage environment where AI agents label, prioritize,
+  and detect duplicate bug reports. Simulates the real-world software
+  engineering workflow of processing an incoming issue backlog.
+  Ships with 3 tasks (easy → medium → hard) and deterministic graders.
+
+tags:
+  - openenv
+  - bug-triage
+  - software-engineering
+  - issue-tracking
+  - productivity
+  - nlp
+
+author: "Paul"
+license: "MIT"
+
+observation_space:
+  type: object
+  description: "Current issue details plus episode progress metadata"
+  properties:
+    issue_id:
+      type: string
+      description: "Unique issue identifier (e.g. ISS-1042)"
+    title:
+      type: string
+      description: "Short title of the issue as filed by the reporter"
+    body:
+      type: string
+      description: "Full description, reproduction steps, and any stack traces"
+    reporter:
+      type: string
+      description: "Username of the person who filed the issue"
+    created_at:
+      type: string
+      description: "Date the issue was created (YYYY-MM-DD format)"
+    comments_count:
+      type: integer
+      description: "Number of follow-up comments on the issue"
+    has_stack_trace:
+      type: boolean
+      description: "True if the issue body contains a stack trace"
+    mentioned_components:
+      type: array
+      items:
+        type: string
+      description: "System components referenced in the body (auth, payment, api, etc.)"
+    issues_remaining:
+      type: integer
+      description: "Number of issues left after the current one"
+    last_action_result:
+      type: string
+      description: "Feedback string from the previous action"
+    cumulative_score:
+      type: number
+      description: "Running total reward for this episode"
+    done:
+      type: boolean
+      description: "True when all issues are triaged and the episode is over"
+
+action_space:
+  type: object
+  description: "One triage decision for the current issue"
+  required:
+    - action_type
+    - severity
+    - issue_id
+  properties:
+    action_type:
+      type: string
+      enum:
+        - label_bug
+        - label_feature
+        - label_duplicate
+        - label_invalid
+        - label_question
+      description: "The label to assign to this issue"
+    severity:
+      type: string
+      enum: [P0, P1, P2, P3]
+      description: "P0=critical, P1=high, P2=medium, P3=low"
+    issue_id:
+      type: string
+      description: "Must match the issue_id in the current observation"
+    duplicate_of:
+      type: string
+      nullable: true
+      description: "Required if action_type is label_duplicate"
+    reasoning:
+      type: string
+      nullable: true
+      description: "Optional explanation — not scored, used for logging"
+
+tasks:
+  - id: easy
+    name: "Basic Label Classification"
+    difficulty: easy
+    description: >
+      Triage 8 clearly written issues. One of each main type.
+      No duplicates. Stack traces present in all bugs.
+      Expected frontier model score: ~0.80
+
+  - id: medium
+    name: "Triage with Duplicate Detection"
+    difficulty: medium
+    description: >
+      15 issues including 2 hidden duplicate pairs.
+      Duplicates are paraphrased versions of earlier issues.
+      Graded on 70% label accuracy + 30% duplicate detection.
+      Expected frontier model score: ~0.55
+
+  - id: hard
+    name: "Full Severity Triage with Subtle Duplicates"
+    difficulty: hard
+    description: >
+      20 issues with subtle wording, ambiguous labels, and subtle duplicates.
+      Severity accuracy is scored. Missing a P0 bug incurs a penalty.
+      Graded on 50% label + 30% severity + 20% duplicate detection.
+      Expected frontier model score: ~0.30
+
+endpoints:
+  reset: "POST /reset"
+  step: "POST /step"
+  state: "GET /state"
+  health: "GET /health"
+
+reward:
+  type: dense
+  range: [0.0, 1.0]
+  description: >
+    Per-step rewards provide a dense signal throughout the episode.
+    Correct label: +0.6. Correct severity: +0.3. Severity off by 1: +0.15.
+    Correct duplicate reference: +0.1. Missing P0 bug: -0.3.
+    All rewards clipped to [0.0, 1.0] per step.
+
+environment:
+  episode_length:
+    easy: 8
+    medium: 15
+    hard: 20
+  reset_clears_state: true
+  observations_are_deterministic: true

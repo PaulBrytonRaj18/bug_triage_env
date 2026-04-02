@@ -1,0 +1,13 @@
+# bug_triage_env/server/requirements.txt
+#
+# Dependencies installed inside the Docker container.
+# Pin minor versions for reproducibility.
+# Keep this in sync with pyproject.toml.
+
+fastapi>=0.100.0,<1.0.0
+uvicorn[standard]>=0.23.0,<1.0.0
+pydantic>=2.0.0,<3.0.0
+openenv-core>=0.1.0
+openai>=1.0.0,<2.0.0
+requests>=2.31.0,<3.0.0
+python-multipart>=0.0.6
