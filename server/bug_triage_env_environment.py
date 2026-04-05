@@ -5,100 +5,102 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Bug Triage Env Environment Implementation.
+Bug Triage Env — OpenEnv-compatible Environment Interface.
 
-A simple test environment that echoes back messages sent to it.
-Perfect for testing HTTP server infrastructure.
+This module provides the OpenEnv Environment wrapper for the Bug Triage
+environment, bridging the FastAPI HTTP server with the openenv-core interface.
 """
 
 from uuid import uuid4
 
-from openenv.core.env_server.interfaces import Environment
-from openenv.core.env_server.types import State
+try:
+    from openenv.core.env_server.interfaces import Environment
+    from openenv.core.env_server.types import State
+except ImportError:
+    Environment = object
+    State = None
 
 try:
-    from ..models import BugTriageAction, BugTriageObservation
+    from ..models import BugAction, BugObservation
 except ImportError:
-    from models import BugTriageAction, BugTriageObservation
+    from models import BugAction, BugObservation
+
+from .environment import BugTriageEnvironment
 
 
-class BugTriageEnvironment(Environment):
+class BugTriageEnvEnvironment(Environment):
     """
-    A simple echo environment that echoes back messages.
+    OpenEnv-compatible wrapper for the Bug Triage Environment.
 
-    This environment is designed for testing the HTTP server infrastructure.
-    It maintains minimal state and simply echoes back whatever message it receives.
+    This class wraps BugTriageEnvironment to expose the openenv-core
+    Environment interface, enabling integration with openenv validate
+    and openenv CLI tools.
 
     Example:
-        >>> env = BugTriageEnvironment()
+        >>> env = BugTriageEnvEnvironment()
         >>> obs = env.reset()
-        >>> print(obs.echoed_message)  # "Bug Triage Env environment ready!"
+        >>> print(obs.issue_id)  # "ISS-1000"
         >>>
-        >>> obs = env.step(BugTriageAction(message="Hello"))
-        >>> print(obs.echoed_message)  # "Hello"
-        >>> print(obs.message_length)  # 5
+        >>> action = BugAction(
+        ...     action_type="label_bug",
+        ...     severity="P1",
+        ...     issue_id=obs.issue_id,
+        ... )
+        >>> obs = env.step(action)
+        >>> print(obs.cumulative_score)  # 0.9
     """
 
-    # Enable concurrent WebSocket sessions.
-    # Set to True if your environment isolates state between instances.
-    # When True, multiple WebSocket clients can connect simultaneously, each
-    # getting their own environment instance (when using factory mode in app.py).
-    SUPPORTS_CONCURRENT_SESSIONS: bool = True
+    SUPPORTS_CONCURRENT_SESSIONS: bool = False
 
     def __init__(self):
-        """Initialize the bug_triage_env environment."""
-        self._state = State(episode_id=str(uuid4()), step_count=0)
-        self._reset_count = 0
+        """Initialize the OpenEnv wrapper."""
+        self._env = BugTriageEnvironment()
+        self._state = State(episode_id=str(uuid4()), step_count=0) if State else None
 
-    def reset(self) -> BugTriageObservation:
+    def reset(self, task_id: str = "easy") -> BugObservation:
         """
-        Reset the environment.
-
-        Returns:
-            BugTriageObservation with a ready message
-        """
-        self._state = State(episode_id=str(uuid4()), step_count=0)
-        self._reset_count += 1
-
-        return BugTriageObservation(
-            echoed_message="Bug Triage Env environment ready!",
-            message_length=0,
-            done=False,
-            reward=0.0,
-        )
-
-    def step(self, action: BugTriageAction) -> BugTriageObservation:  # type: ignore[override]
-        """
-        Execute a step in the environment by echoing the message.
+        Reset the environment for the given task.
 
         Args:
-            action: BugTriageAction containing the message to echo
+            task_id: One of 'easy', 'medium', 'hard'
 
         Returns:
-            BugTriageObservation with the echoed message and its length
+            BugObservation with the first issue
         """
-        self._state.step_count += 1
+        obs = self._env.reset(task_id=task_id)
+        if self._state:
+            self._state = State(
+                episode_id=str(uuid4()),
+                step_count=0,
+            )
+        return obs
 
-        message = action.message
-        length = len(message)
+    def step(self, action: BugAction) -> BugObservation:  # type: ignore[override]
+        """
+        Execute one triage step.
 
-        # Simple reward: longer messages get higher rewards
-        reward = length * 0.1
+        Args:
+            action: BugAction with the triage decision
 
-        return BugTriageObservation(
-            echoed_message=message,
-            message_length=length,
-            done=False,
-            reward=reward,
-            metadata={"original_message": message, "step": self._state.step_count},
-        )
+        Returns:
+            BugObservation with the next issue and reward info
+        """
+        obs = self._env.step(action)
+        if self._state:
+            self._state = State(
+                episode_id=self._state.episode_id,
+                step_count=self._env.state.step_count,
+            )
+        return obs
 
     @property
-    def state(self) -> State:
-        """
-        Get the current environment state.
+    def state(self):
+        """Return the current episode state."""
+        if self._state:
+            return self._state
+        return self._env.state
 
-        Returns:
-            Current State with episode_id and step_count
-        """
-        return self._state
+    @property
+    def triaged(self):
+        """Return the list of triaged actions this episode."""
+        return self._env.triaged

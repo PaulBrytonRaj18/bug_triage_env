@@ -12,9 +12,9 @@
 #
 # Run locally:
 #   ENV_URL=http://localhost:7860 \
-#   API_BASE_URL=https://api.openai.com/v1 \
-#   MODEL_NAME=gpt-4o-mini \
-#   HF_TOKEN=your_key_here \
+#   API_BASE_URL=https://generativelanguage.googleapis.com/v1beta/models \
+#   MODEL_NAME=gemini-1.5-flash \
+#   HF_TOKEN=your_gemini_api_key \
 #   python inference.py
 #
 # The judges will set API_BASE_URL, MODEL_NAME, HF_TOKEN in their
@@ -27,7 +27,7 @@ import json
 import os
 import sys
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 from openai import OpenAI
@@ -36,18 +36,26 @@ from openai import OpenAI
 # Environment variables — all required by hackathon spec
 # ---------------------------------------------------------------------------
 
-API_BASE_URL: str = os.environ.get("API_BASE_URL", "https://api.openai.com/v1")
-MODEL_NAME:   str = os.environ.get("MODEL_NAME",   "gpt-4o-mini")
-HF_TOKEN:     str = os.environ.get("HF_TOKEN",     "")
-ENV_URL:      str = os.environ.get("ENV_URL",       "http://localhost:7860").rstrip("/")
+API_BASE_URL: str = os.environ.get(
+    "API_BASE_URL",
+    "https://generativelanguage.googleapis.com/v1beta/models",
+)
+MODEL_NAME: str = os.environ.get("MODEL_NAME", "gemini-1.5-flash")
+HF_TOKEN: str = os.environ.get("HF_TOKEN", "")
+ENV_URL: str = os.environ.get("ENV_URL", "http://localhost:7860").rstrip("/")
+TASK_NAME: str = os.environ.get("BUG_TRIAGE_TASK", "bug-triage")
+BENCHMARK: str = os.environ.get("BUG_TRIAGE_BENCHMARK", "bug-triage")
+MAX_STEPS: int = 25
+TEMPERATURE: float = 0.0
+MAX_TOKENS: int = 300
 
 # ---------------------------------------------------------------------------
-# OpenAI-compatible client (required by hackathon spec)
+# OpenAI-compatible client (works with Gemini, OpenAI, and HF endpoints)
 # ---------------------------------------------------------------------------
 
 client = OpenAI(
     base_url=API_BASE_URL,
-    api_key=HF_TOKEN or "no-key",  # some endpoints don't need a key
+    api_key=HF_TOKEN or "no-key",
 )
 
 # ---------------------------------------------------------------------------
@@ -101,8 +109,67 @@ Strong signals:
   - One-word body, gibberish, or "test" = label_invalid"""
 
 # ---------------------------------------------------------------------------
+# Logging functions — MANDATORY STDOUT FORMAT
+# ---------------------------------------------------------------------------
+
+
+def log_start(task: str, env: str, model: str) -> None:
+    """Print [START] line. One per episode, at the very beginning."""
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+
+def log_step(
+    step: int,
+    action: Dict[str, Any],
+    reward: float,
+    done: bool,
+    error: Optional[str],
+) -> None:
+    """
+    Print [STEP] line. One per step, immediately after /step returns.
+
+    Rules:
+      - reward formatted to 2 decimal places
+      - done is lowercase: true or false
+      - error is raw string or null
+      - action is a compact JSON string on single line
+    """
+    action_str = json.dumps(action, separators=(",", ":"))
+    error_val = error if error else "null"
+    done_val = "true" if done else "false"
+    print(
+        f"[STEP] step={step} action={action_str} reward={reward:.2f} "
+        f"done={done_val} error={error_val}",
+        flush=True,
+    )
+
+
+def log_end(
+    success: bool,
+    steps: int,
+    score: float,
+    rewards: List[float],
+) -> None:
+    """
+    Print [END] line. Always emitted, even on exception.
+
+    Rules:
+      - success is lowercase: true or false
+      - score formatted to 3 decimal places
+      - rewards formatted to 2 decimal places, comma-separated
+    """
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    success_val = "true" if success else "false"
+    print(
+        f"[END] success={success_val} steps={steps} score={score:.3f} rewards={rewards_str}",
+        flush=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Prompt builder — formats the current observation for the LLM
 # ---------------------------------------------------------------------------
+
 
 def build_user_prompt(obs: Dict[str, Any], seen_issues: list) -> str:
     """
@@ -112,8 +179,12 @@ def build_user_prompt(obs: Dict[str, Any], seen_issues: list) -> str:
     seen_summary = ""
     if seen_issues:
         lines = ["Issues already triaged this session (for duplicate detection):"]
-        for s in seen_issues[-10:]:  # last 10 to stay within context
-            dup_note = f" [you labeled as duplicate of {s['duplicate_of']}]" if s.get("duplicate_of") else ""
+        for s in seen_issues[-10:]:
+            dup_note = (
+                f" [you labeled as duplicate of {s['duplicate_of']}]"
+                if s.get("duplicate_of")
+                else ""
+            )
             lines.append(f"  {s['issue_id']}: [{s['action_type']}] {s['title'][:60]}{dup_note}")
         seen_summary = "\n".join(lines) + "\n\n"
 
@@ -122,19 +193,19 @@ def build_user_prompt(obs: Dict[str, Any], seen_issues: list) -> str:
 
     return f"""{seen_summary}Current issue to triage:
 
-Issue ID:    {obs['issue_id']}
-Title:       {obs['title']}
-Reporter:    {obs['reporter']}
-Filed on:    {obs['created_at']}
-Comments:    {obs['comments_count']}
+Issue ID:    {obs["issue_id"]}
+Title:       {obs["title"]}
+Reporter:    {obs["reporter"]}
+Filed on:    {obs["created_at"]}
+Comments:    {obs["comments_count"]}
 Stack trace: {has_trace}
 Components:  {components}
-Issues remaining after this one: {obs.get('issues_remaining', '?')}
+Issues remaining after this one: {obs.get("issues_remaining", "?")}
 
 Body:
-{obs['body']}
+{obs["body"]}
 
-Previous action feedback: {obs.get('last_action_result', 'none')}
+Previous action feedback: {obs.get("last_action_result", "none")}
 
 Return your triage decision as a JSON object now."""
 
@@ -142,6 +213,7 @@ Return your triage decision as a JSON object now."""
 # ---------------------------------------------------------------------------
 # LLM call with retry and fallback
 # ---------------------------------------------------------------------------
+
 
 def call_llm(
     user_prompt: str,
@@ -155,24 +227,27 @@ def call_llm(
     Retries up to `retries` times on JSON parse failure or API error.
     """
     for attempt in range(1, retries + 1):
+        raw = ""
         try:
             response = client.chat.completions.create(
                 model=MODEL_NAME,
-                max_tokens=300,
-                temperature=0.0,  # deterministic — same issue always same answer
+                max_tokens=MAX_TOKENS,
+                temperature=TEMPERATURE,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",   "content": user_prompt},
+                    {"role": "user", "content": user_prompt},
                 ],
             )
             raw = response.choices[0].message.content.strip()
 
             # Strip markdown fences if the model added them anyway
             if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-                raw = raw.strip()
+                parts = raw.split("```")
+                if len(parts) >= 3:
+                    raw = parts[1]
+                    if raw.startswith("json"):
+                        raw = raw[4:]
+                    raw = raw.strip()
 
             parsed = json.loads(raw)
 
@@ -184,11 +259,11 @@ def call_llm(
             return parsed
 
         except json.JSONDecodeError as e:
-            print(f"    [attempt {attempt}] JSON parse error: {e}. Raw: {raw[:80]!r}")
+            print(f"    [attempt {attempt}] JSON parse error: {e}. Raw: {raw[:80]!r}", flush=True)
         except ValueError as e:
-            print(f"    [attempt {attempt}] Validation error: {e}")
+            print(f"    [attempt {attempt}] Validation error: {e}", flush=True)
         except Exception as e:
-            print(f"    [attempt {attempt}] API error: {type(e).__name__}: {e}")
+            print(f"    [attempt {attempt}] API error: {type(e).__name__}: {e}", flush=True)
 
         if attempt < retries:
             time.sleep(retry_delay)
@@ -200,23 +275,34 @@ def call_llm(
 # Fallback action — used when LLM fails completely
 # ---------------------------------------------------------------------------
 
+
 def fallback_action(issue_id: str) -> Dict[str, Any]:
     """
     Safe fallback when LLM fails. Labels as bug P2 — never triggers P0 penalty
     but also never scores full marks. Better than crashing.
     """
     return {
-        "action_type":  "label_bug",
-        "severity":     "P2",
-        "issue_id":     issue_id,
+        "action_type": "label_bug",
+        "severity": "P2",
+        "issue_id": issue_id,
         "duplicate_of": None,
-        "reasoning":    "Fallback decision — LLM call failed.",
+        "reasoning": "Fallback decision — LLM call failed.",
     }
 
 
 # ---------------------------------------------------------------------------
 # Environment HTTP helpers
 # ---------------------------------------------------------------------------
+
+
+def env_health() -> bool:
+    """Check if the environment server is reachable."""
+    try:
+        resp = requests.get(f"{ENV_URL}/health", timeout=10)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
 
 def env_reset(task_id: str) -> Optional[Dict[str, Any]]:
     """Call POST /reset and return the observation dict."""
@@ -229,7 +315,7 @@ def env_reset(task_id: str) -> Optional[Dict[str, Any]]:
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        print(f"  [ERROR] /reset failed: {e}")
+        print(f"[ERROR] /reset failed: {e}", flush=True)
         return None
 
 
@@ -244,22 +330,14 @@ def env_step(action: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        print(f"  [ERROR] /step failed: {e}")
+        print(f"[ERROR] /step failed: {e}", flush=True)
         return None
-
-
-def env_health() -> bool:
-    """Check if the environment server is reachable."""
-    try:
-        resp = requests.get(f"{ENV_URL}/health", timeout=10)
-        return resp.status_code == 200
-    except Exception:
-        return False
 
 
 # ---------------------------------------------------------------------------
 # Single task runner
 # ---------------------------------------------------------------------------
+
 
 def run_task(task_id: str) -> float:
     """
@@ -268,71 +346,86 @@ def run_task(task_id: str) -> float:
     Returns the normalized final score as a float in [0.0, 1.0].
     Returns 0.0 on environment connection failure.
     """
-    print(f"\n{'='*60}")
-    print(f"  Task: {task_id.upper()}")
-    print(f"{'='*60}")
+    TASK_INBOX_SIZES = {"easy": 8, "medium": 15, "hard": 20}
+    inbox_size = TASK_INBOX_SIZES.get(task_id, 8)
+
+    log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
     # Reset environment
     obs = env_reset(task_id)
     if obs is None:
-        print(f"  [FAIL] Could not reset environment for task '{task_id}'")
+        log_end(success=False, steps=0, score=0.0, rewards=[])
         return 0.0
 
-    seen_issues: list = []  # track triaged issues for duplicate detection
-    step_num:    int   = 0
-    max_steps:   int   = 25  # hard ceiling — no task has more than 20 issues
+    seen_issues: list = []
+    step_num: int = 0
+    step_rewards: List[float] = []
+    prev_cumulative: float = 0.0
+    error: Optional[str] = None
+    current_action: Optional[Dict[str, Any]] = None
 
-    while not obs.get("done", False) and step_num < max_steps:
-        step_num += 1
-        issue_id = obs["issue_id"]
+    try:
+        while not obs.get("done", False) and step_num < MAX_STEPS:
+            step_num += 1
+            issue_id = obs["issue_id"]
 
-        print(f"  Step {step_num:02d} | {issue_id} | {obs['title'][:50]!r}")
+            # Build prompt and call LLM
+            user_prompt = build_user_prompt(obs, seen_issues)
+            current_action = call_llm(user_prompt)
 
-        # Build prompt and call LLM
-        user_prompt = build_user_prompt(obs, seen_issues)
-        action      = call_llm(user_prompt)
+            if current_action is None:
+                error = "LLM call failed after 3 retries"
+                current_action = fallback_action(issue_id)
+            else:
+                error = None
 
-        if action is None:
-            print(f"    [WARN] LLM failed — using fallback action")
-            action = fallback_action(issue_id)
+            # Always ensure issue_id matches — the server rejects mismatches
+            current_action["issue_id"] = issue_id
 
-        # Always ensure issue_id matches — the server rejects mismatches
-        action["issue_id"] = issue_id
+            # Record for duplicate detection context
+            seen_issues.append(
+                {
+                    "issue_id": issue_id,
+                    "title": obs["title"],
+                    "action_type": current_action["action_type"],
+                    "duplicate_of": current_action.get("duplicate_of"),
+                }
+            )
 
-        # Record for duplicate detection context
-        seen_issues.append({
-            "issue_id":    issue_id,
-            "title":       obs["title"],
-            "action_type": action["action_type"],
-            "duplicate_of": action.get("duplicate_of"),
-        })
+            # Submit action
+            obs = env_step(current_action)
+            if obs is None:
+                error = f"/step call failed at step {step_num}"
+                step_rewards.append(0.0)
+                log_step(step_num, current_action, 0.0, True, error)
+                break
 
-        print(
-            f"    -> {action['action_type']:18s} | {action['severity']} "
-            f"| dup_of={action.get('duplicate_of')}"
-        )
+            # Derive step reward from cumulative score delta
+            curr_cumulative = obs.get("cumulative_score", 0.0)
+            step_reward = round(curr_cumulative - prev_cumulative, 3)
+            prev_cumulative = curr_cumulative
+            step_rewards.append(step_reward)
 
-        # Submit action
-        obs = env_step(action)
-        if obs is None:
-            print(f"    [FAIL] /step call failed at step {step_num}")
-            break
+            done = obs.get("done", False)
+            log_step(step_num, current_action, step_reward, done, error)
 
-        feedback = obs.get("last_action_result", "")
-        score    = obs.get("cumulative_score", 0.0)
-        print(f"    <- score={score:.4f} | {feedback[:70]}")
+            # Small delay to avoid rate limits on shared API endpoints
+            time.sleep(0.3)
 
-        # Small delay to avoid rate limits on shared API endpoints
-        time.sleep(0.3)
+    except Exception as e:
+        error = f"Unexpected error: {type(e).__name__}: {e}"
+        print(f"[ERROR] {error}", flush=True)
+        if current_action:
+            log_step(step_num, current_action, 0.0, True, error)
 
-    # Final score from last observation
+    # Calculate final normalized score: cumulative / inbox_size
     final_cumulative = obs.get("cumulative_score", 0.0) if obs else 0.0
+    normalized = round(final_cumulative / inbox_size, 3)
+    normalized = max(0.0, min(1.0, normalized))
 
-    # Normalize: divide cumulative by number of steps taken
-    # (each step max reward = 1.0, so max cumulative = step_num)
-    normalized = round(final_cumulative / max(step_num, 1), 4)
+    success = normalized > 0.0 or step_num > 0
+    log_end(success=success, steps=step_num, score=normalized, rewards=step_rewards)
 
-    print(f"\n  Final | steps={step_num} | cumulative={final_cumulative:.4f} | normalized={normalized:.4f}")
     return normalized
 
 
@@ -340,22 +433,25 @@ def run_task(task_id: str) -> float:
 # Main entrypoint
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
-    print("\nBug Triage Environment — Baseline Inference")
-    print(f"  ENV_URL      : {ENV_URL}")
-    print(f"  API_BASE_URL : {API_BASE_URL}")
-    print(f"  MODEL_NAME   : {MODEL_NAME}")
-    print(f"  HF_TOKEN     : {'set' if HF_TOKEN else 'NOT SET — check your environment'}")
+    print(f"Bug Triage Environment — Inference Script", flush=True)
+    print(f"  ENV_URL      : {ENV_URL}", flush=True)
+    print(f"  API_BASE_URL : {API_BASE_URL}", flush=True)
+    print(f"  MODEL_NAME   : {MODEL_NAME}", flush=True)
+    print(
+        f"  HF_TOKEN     : {'set' if HF_TOKEN else 'NOT SET — check your environment'}", flush=True
+    )
 
     # Health check before starting
-    print(f"\nChecking environment server at {ENV_URL} ...")
+    print(f"\nChecking environment server at {ENV_URL} ...", flush=True)
     if not env_health():
-        print(f"[ERROR] Environment server not reachable at {ENV_URL}")
-        print("  Make sure the server is running:")
-        print("    uvicorn server.app:app --port 7860")
-        print("  Or set ENV_URL to your HuggingFace Space URL.")
+        print(f"[ERROR] Environment server not reachable at {ENV_URL}", flush=True)
+        print("  Make sure the server is running:", flush=True)
+        print("    uvicorn bug_triage_env.server.app:app --port 7860", flush=True)
+        print("  Or set ENV_URL to your HuggingFace Space URL.", flush=True)
         sys.exit(1)
-    print("  Server is healthy.\n")
+    print("  Server is healthy.\n", flush=True)
 
     # Run all 3 tasks
     scores: Dict[str, float] = {}
@@ -365,25 +461,24 @@ def main() -> None:
         task_start = time.time()
         scores[task_id] = run_task(task_id)
         elapsed = time.time() - task_start
-        print(f"  Task '{task_id}' completed in {elapsed:.1f}s")
+        print(f"  Task '{task_id}' completed in {elapsed:.1f}s", flush=True)
 
     total_elapsed = time.time() - start_time
 
     # Print final results table
-    print(f"\n{'='*60}")
-    print("  BASELINE RESULTS")
-    print(f"{'='*60}")
-    print(f"  {'Task':<10} {'Score':>8}")
-    print(f"  {'-'*20}")
+    print(f"\n{'=' * 60}", flush=True)
+    print("  BASELINE RESULTS", flush=True)
+    print(f"{'=' * 60}", flush=True)
+    print(f"  {'Task':<10} {'Score':>8}", flush=True)
+    print(f"  {'-' * 20}", flush=True)
     for task_id, score in scores.items():
-        bar = "█" * int(score * 20)
-        print(f"  {task_id:<10} {score:>8.4f}  {bar}")
-    print(f"  {'-'*20}")
+        bar = "=" * int(score * 20)
+        print(f"  {task_id:<10} {score:>8.3f}  {bar}", flush=True)
+    print(f"  {'-' * 20}", flush=True)
     avg = sum(scores.values()) / len(scores)
-    print(f"  {'average':<10} {avg:>8.4f}")
-    print(f"{'='*60}")
-    print(f"  Total time: {total_elapsed:.1f}s")
-    print()
+    print(f"  {'average':<10} {avg:>8.3f}", flush=True)
+    print(f"{'=' * 60}", flush=True)
+    print(f"  Total time: {total_elapsed:.1f}s", flush=True)
 
 
 if __name__ == "__main__":

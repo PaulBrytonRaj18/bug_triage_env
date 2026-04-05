@@ -1,9 +1,15 @@
 # bug_triage_env/server/app.py
 from __future__ import annotations
+import sys
+import os
 from typing import Any, Dict, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 from models import BugAction, BugObservation
 from server.environment import BugTriageEnvironment, VALID_TASK_IDS
@@ -21,25 +27,29 @@ env = BugTriageEnvironment()
 # Request schemas
 # ---------------------------------------------------------------------------
 
+
 class ResetRequest(BaseModel):
     task_id: str = Field(default="easy", description="easy | medium | hard")
 
 
 class StepRequest(BaseModel):
-    action_type:  str            = Field(..., description="label_bug|label_feature|label_duplicate|label_invalid|label_question")
-    severity:     str            = Field(..., description="P0|P1|P2|P3")
-    issue_id:     str            = Field(..., description="Must match current observation's issue_id")
-    duplicate_of: Optional[str]  = Field(default=None)
-    reasoning:    Optional[str]  = Field(default=None)
+    action_type: str = Field(
+        ..., description="label_bug|label_feature|label_duplicate|label_invalid|label_question"
+    )
+    severity: str = Field(..., description="P0|P1|P2|P3")
+    issue_id: str = Field(..., description="Must match current observation's issue_id")
+    duplicate_of: Optional[str] = Field(default=None)
+    reasoning: Optional[str] = Field(default=None)
 
 
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
+
 @app.get("/", include_in_schema=False)
 async def root() -> RedirectResponse:
-    return RedirectResponse(url="/health")
+    return RedirectResponse(url="/docs")
 
 
 @app.get("/health", tags=["System"])
@@ -93,11 +103,11 @@ async def reset(body: ResetRequest) -> BugObservation:
 async def step(body: StepRequest) -> BugObservation:
     """Submit a triage action. Returns the next issue."""
     action = BugAction(
-        action_type  = body.action_type,
-        severity     = body.severity,
-        issue_id     = body.issue_id,
-        duplicate_of = body.duplicate_of,
-        reasoning    = body.reasoning,
+        action_type=body.action_type,
+        severity=body.severity,
+        issue_id=body.issue_id,
+        duplicate_of=body.duplicate_of,
+        reasoning=body.reasoning,
     )
     return env.step(action)
 
