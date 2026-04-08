@@ -10,13 +10,14 @@
 # the OpenEnv spec and pass openenv validate.
 
 from __future__ import annotations
-from typing import ClassVar, FrozenSet, List, Optional
+from typing import Any, ClassVar, Dict, FrozenSet, List, Optional
 from pydantic import BaseModel, Field
 
 
 # ---------------------------------------------------------------------------
 # Action — what the agent does each step
 # ---------------------------------------------------------------------------
+
 
 class BugAction(BaseModel):
     """
@@ -75,13 +76,15 @@ class BugAction(BaseModel):
     # Validation helpers
     # ------------------------------------------------------------------
 
-    VALID_LABELS: ClassVar[FrozenSet[str]] = frozenset({
-        "label_bug",
-        "label_feature",
-        "label_duplicate",
-        "label_invalid",
-        "label_question",
-    })
+    VALID_LABELS: ClassVar[FrozenSet[str]] = frozenset(
+        {
+            "label_bug",
+            "label_feature",
+            "label_duplicate",
+            "label_invalid",
+            "label_question",
+        }
+    )
 
     VALID_SEVERITIES: ClassVar[FrozenSet[str]] = frozenset({"P0", "P1", "P2", "P3"})
 
@@ -95,6 +98,7 @@ class BugAction(BaseModel):
 # ---------------------------------------------------------------------------
 # Observation — what the agent receives after reset() or step()
 # ---------------------------------------------------------------------------
+
 
 class BugObservation(BaseModel):
     """
@@ -155,3 +159,36 @@ class BugObservation(BaseModel):
         ...,
         description="True when all issues in the inbox have been triaged. Episode is over.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Step Result — return value from step(), per OpenEnv spec
+# ---------------------------------------------------------------------------
+
+
+class BugStepResult(BaseModel):
+    """
+    Return value from step(), complying with OpenEnv spec.
+
+    OpenEnv requires: step(action) -> (observation, reward, done, info)
+    This model wraps all four components.
+
+    Attribute delegation: properties on BugObservation are accessible directly
+    on BugStepResult (e.g. result.cumulative_score reads result.observation.cumulative_score).
+    This ensures backward compatibility with existing code that treats the step()
+    return value as an observation object.
+    """
+
+    observation: BugObservation
+    reward: float = Field(..., ge=0.0, le=1.0, description="Step reward in [0.0, 1.0]")
+    done: bool = Field(..., description="True when episode is over")
+    info: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Debug metadata (last_action_result, step_count, etc.)",
+    )
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate attribute access to observation for backward compatibility."""
+        if name.startswith("_") or name in ("observation", "reward", "done", "info"):
+            raise AttributeError(name)
+        return getattr(self.observation, name)

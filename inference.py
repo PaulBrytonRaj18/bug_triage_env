@@ -23,18 +23,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
 import time
 from typing import Any, Dict, List, Optional
 
-import requests
 from openai import OpenAI
-
-# ---------------------------------------------------------------------------
-# Environment variables — all required by hackathon spec
-# ---------------------------------------------------------------------------
 
 API_BASE_URL: str = os.environ.get(
     "API_BASE_URL",
@@ -49,18 +45,8 @@ MAX_STEPS: int = 25
 TEMPERATURE: float = 0.0
 MAX_TOKENS: int = 300
 
-# ---------------------------------------------------------------------------
-# OpenAI-compatible client (works with Gemini, OpenAI, and HF endpoints)
-# ---------------------------------------------------------------------------
-
-client = OpenAI(
-    base_url=API_BASE_URL,
-    api_key=HF_TOKEN or "no-key",
-)
-
-# ---------------------------------------------------------------------------
-# System prompt — gives the LLM everything it needs to triage correctly
-# ---------------------------------------------------------------------------
+from server.bug_triage_env_environment import BugTriageEnvEnvironment
+from models import BugAction
 
 SYSTEM_PROMPT = """You are a senior software engineer triaging incoming GitHub issue reports.
 
@@ -107,10 +93,6 @@ Strong signals:
   - "would love", "please add", "could you" = label_feature
   - "how do I", "what is the" = label_question
   - One-word body, gibberish, or "test" = label_invalid"""
-
-# ---------------------------------------------------------------------------
-# Logging functions — MANDATORY STDOUT FORMAT
-# ---------------------------------------------------------------------------
 
 
 def log_start(task: str, env: str, model: str) -> None:
@@ -166,11 +148,6 @@ def log_end(
     )
 
 
-# ---------------------------------------------------------------------------
-# Prompt builder — formats the current observation for the LLM
-# ---------------------------------------------------------------------------
-
-
 def build_user_prompt(obs: Dict[str, Any], seen_issues: list) -> str:
     """
     Build the user-turn prompt from the current observation.
@@ -210,12 +187,8 @@ Previous action feedback: {obs.get("last_action_result", "none")}
 Return your triage decision as a JSON object now."""
 
 
-# ---------------------------------------------------------------------------
-# LLM call with retry and fallback
-# ---------------------------------------------------------------------------
-
-
 def call_llm(
+    client: OpenAI,
     user_prompt: str,
     retries: int = 3,
     retry_delay: float = 2.0,
@@ -238,9 +211,8 @@ def call_llm(
                     {"role": "user", "content": user_prompt},
                 ],
             )
-            raw = response.choices[0].message.content.strip()
+            raw = (response.choices[0].message.content or "").strip()
 
-            # Strip markdown fences if the model added them anyway
             if raw.startswith("```"):
                 parts = raw.split("```")
                 if len(parts) >= 3:
@@ -251,7 +223,6 @@ def call_llm(
 
             parsed = json.loads(raw)
 
-            # Validate required fields exist
             required = {"action_type", "severity", "issue_id"}
             if not required.issubset(parsed.keys()):
                 raise ValueError(f"Missing required fields. Got: {list(parsed.keys())}")
@@ -259,21 +230,22 @@ def call_llm(
             return parsed
 
         except json.JSONDecodeError as e:
-            print(f"    [attempt {attempt}] JSON parse error: {e}. Raw: {raw[:80]!r}", flush=True)
+            print(
+                f"    [attempt {attempt}] JSON parse error: {e}. Raw: {raw[:80]!r}",
+                flush=True,
+            )
         except ValueError as e:
             print(f"    [attempt {attempt}] Validation error: {e}", flush=True)
         except Exception as e:
-            print(f"    [attempt {attempt}] API error: {type(e).__name__}: {e}", flush=True)
+            print(
+                f"    [attempt {attempt}] API error: {type(e).__name__}: {e}",
+                flush=True,
+            )
 
         if attempt < retries:
             time.sleep(retry_delay)
 
     return None
-
-
-# ---------------------------------------------------------------------------
-# Fallback action — used when LLM fails completely
-# ---------------------------------------------------------------------------
 
 
 def fallback_action(issue_id: str) -> Dict[str, Any]:
@@ -290,56 +262,7 @@ def fallback_action(issue_id: str) -> Dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Environment HTTP helpers
-# ---------------------------------------------------------------------------
-
-
-def env_health() -> bool:
-    """Check if the environment server is reachable."""
-    try:
-        resp = requests.get(f"{ENV_URL}/health", timeout=10)
-        return resp.status_code == 200
-    except Exception:
-        return False
-
-
-def env_reset(task_id: str) -> Optional[Dict[str, Any]]:
-    """Call POST /reset and return the observation dict."""
-    try:
-        resp = requests.post(
-            f"{ENV_URL}/reset",
-            json={"task_id": task_id},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        print(f"[ERROR] /reset failed: {e}", flush=True)
-        return None
-
-
-def env_step(action: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Call POST /step and return the observation dict."""
-    try:
-        resp = requests.post(
-            f"{ENV_URL}/step",
-            json=action,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        print(f"[ERROR] /step failed: {e}", flush=True)
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Single task runner
-# ---------------------------------------------------------------------------
-
-
-def run_task(task_id: str) -> float:
+async def run_task(client: OpenAI, task_id: str) -> float:
     """
     Run one full episode for the given task_id.
 
@@ -351,27 +274,34 @@ def run_task(task_id: str) -> float:
 
     log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
-    # Reset environment
-    obs = env_reset(task_id)
-    if obs is None:
+    env = BugTriageEnvEnvironment()
+
+    try:
+        obs = env.reset(task_id=task_id)
+    except Exception as e:
+        print(f"[ERROR] env.reset() failed: {e}", flush=True)
         log_end(success=False, steps=0, score=0.0, rewards=[])
         return 0.0
+
+    if isinstance(obs, dict):
+        obs_dict = obs
+    else:
+        obs_dict = obs.model_dump() if hasattr(obs, "model_dump") else vars(obs)
 
     seen_issues: list = []
     step_num: int = 0
     step_rewards: List[float] = []
-    prev_cumulative: float = 0.0
     error: Optional[str] = None
     current_action: Optional[Dict[str, Any]] = None
 
     try:
-        while not obs.get("done", False) and step_num < MAX_STEPS:
+        done = obs_dict.get("done", False)
+        while not done and step_num < MAX_STEPS:
             step_num += 1
-            issue_id = obs["issue_id"]
+            issue_id = obs_dict["issue_id"]
 
-            # Build prompt and call LLM
-            user_prompt = build_user_prompt(obs, seen_issues)
-            current_action = call_llm(user_prompt)
+            user_prompt = build_user_prompt(obs_dict, seen_issues)
+            current_action = call_llm(client, user_prompt)
 
             if current_action is None:
                 error = "LLM call failed after 3 retries"
@@ -379,37 +309,51 @@ def run_task(task_id: str) -> float:
             else:
                 error = None
 
-            # Always ensure issue_id matches — the server rejects mismatches
             current_action["issue_id"] = issue_id
 
-            # Record for duplicate detection context
             seen_issues.append(
                 {
                     "issue_id": issue_id,
-                    "title": obs["title"],
+                    "title": obs_dict["title"],
                     "action_type": current_action["action_type"],
                     "duplicate_of": current_action.get("duplicate_of"),
                 }
             )
 
-            # Submit action
-            obs = env_step(current_action)
-            if obs is None:
-                error = f"/step call failed at step {step_num}"
+            try:
+                action = BugAction(
+                    action_type=current_action["action_type"],
+                    severity=current_action["severity"],
+                    issue_id=current_action["issue_id"],
+                    duplicate_of=current_action.get("duplicate_of"),
+                    reasoning=current_action.get("reasoning"),
+                )
+                next_obs = env.step(action)
+            except Exception as e:
+                print(f"[ERROR] env.step() failed at step {step_num}: {e}", flush=True)
                 step_rewards.append(0.0)
-                log_step(step_num, current_action, 0.0, True, error)
+                log_step(step_num, current_action, 0.0, True, f"step failed: {e}")
                 break
 
-            # Derive step reward from cumulative score delta
-            curr_cumulative = obs.get("cumulative_score", 0.0)
-            step_reward = round(curr_cumulative - prev_cumulative, 3)
-            prev_cumulative = curr_cumulative
+            if isinstance(next_obs, dict):
+                obs_dict = next_obs
+            else:
+                obs_dict = (
+                    next_obs.model_dump() if hasattr(next_obs, "model_dump") else vars(next_obs)
+                )
+
+            step_reward = obs_dict.get("last_action_result", "0.0")
+            if isinstance(step_reward, str):
+                try:
+                    step_reward = float(step_reward.split("step_reward:")[-1].strip().split()[0])
+                except:
+                    step_reward = 0.0
+
             step_rewards.append(step_reward)
 
-            done = obs.get("done", False)
+            done = obs_dict.get("done", False)
             log_step(step_num, current_action, step_reward, done, error)
 
-            # Small delay to avoid rate limits on shared API endpoints
             time.sleep(0.3)
 
     except Exception as e:
@@ -418,8 +362,7 @@ def run_task(task_id: str) -> float:
         if current_action:
             log_step(step_num, current_action, 0.0, True, error)
 
-    # Calculate final normalized score: cumulative / inbox_size
-    final_cumulative = obs.get("cumulative_score", 0.0) if obs else 0.0
+    final_cumulative = obs_dict.get("cumulative_score", 0.0)
     normalized = round(final_cumulative / inbox_size, 3)
     normalized = max(0.0, min(1.0, normalized))
 
@@ -429,43 +372,28 @@ def run_task(task_id: str) -> float:
     return normalized
 
 
-# ---------------------------------------------------------------------------
-# Main entrypoint
-# ---------------------------------------------------------------------------
-
-
-def main() -> None:
+async def main() -> None:
     print(f"Bug Triage Environment — Inference Script", flush=True)
-    print(f"  ENV_URL      : {ENV_URL}", flush=True)
     print(f"  API_BASE_URL : {API_BASE_URL}", flush=True)
     print(f"  MODEL_NAME   : {MODEL_NAME}", flush=True)
     print(
-        f"  HF_TOKEN     : {'set' if HF_TOKEN else 'NOT SET — check your environment'}", flush=True
+        f"  HF_TOKEN     : {'set' if HF_TOKEN else 'NOT SET — check your environment'}",
+        flush=True,
     )
 
-    # Health check before starting
-    print(f"\nChecking environment server at {ENV_URL} ...", flush=True)
-    if not env_health():
-        print(f"[ERROR] Environment server not reachable at {ENV_URL}", flush=True)
-        print("  Make sure the server is running:", flush=True)
-        print("    uvicorn bug_triage_env.server.app:app --port 7860", flush=True)
-        print("  Or set ENV_URL to your HuggingFace Space URL.", flush=True)
-        sys.exit(1)
-    print("  Server is healthy.\n", flush=True)
+    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN or "no-key")
 
-    # Run all 3 tasks
     scores: Dict[str, float] = {}
     start_time = time.time()
 
     for task_id in ["easy", "medium", "hard"]:
         task_start = time.time()
-        scores[task_id] = run_task(task_id)
+        scores[task_id] = await run_task(client, task_id)
         elapsed = time.time() - task_start
         print(f"  Task '{task_id}' completed in {elapsed:.1f}s", flush=True)
 
     total_elapsed = time.time() - start_time
 
-    # Print final results table
     print(f"\n{'=' * 60}", flush=True)
     print("  BASELINE RESULTS", flush=True)
     print(f"{'=' * 60}", flush=True)
@@ -482,4 +410,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

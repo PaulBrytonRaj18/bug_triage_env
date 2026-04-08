@@ -36,5 +36,5 @@ line-length = 100
 target-version = "py310"
 
 [tool.pytest.ini_options]
-testpaths = ["server/tests"]
+testpaths = ["server/tests", "tests"]
 asyncio_mode = "auto"

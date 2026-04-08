@@ -2,27 +2,29 @@
 from __future__ import annotations
 import sys, os, uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from models import BugAction, BugObservation
+from models import BugAction, BugObservation, BugStepResult
 from issue_generator import generate_inbox, strip_ground_truth
 
 # Reward constants
-REWARD_CORRECT_LABEL     =  0.60
-REWARD_CORRECT_SEVERITY  =  0.30
-REWARD_SEVERITY_OFF_ONE  =  0.15
-REWARD_CORRECT_DUPLICATE =  0.10
-PENALTY_MISSED_P0        = -0.30
-PENALTY_INVALID_ACTION   = -0.20
+REWARD_CORRECT_LABEL = 0.60
+REWARD_CORRECT_SEVERITY = 0.30
+REWARD_SEVERITY_OFF_ONE = 0.15
+REWARD_CORRECT_DUPLICATE = 0.10
+PENALTY_MISSED_P0 = -0.30
+PENALTY_INVALID_ACTION = -0.20
 PENALTY_INVALID_SEVERITY = -0.10
-PENALTY_WRONG_ISSUE_ID   = -0.10
+PENALTY_WRONG_ISSUE_ID = -0.10
 
 SEVERITY_MAP: Dict[str, int] = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
-VALID_LABELS = frozenset({"label_bug", "label_feature", "label_duplicate", "label_invalid", "label_question"})
+VALID_LABELS = frozenset(
+    {"label_bug", "label_feature", "label_duplicate", "label_invalid", "label_question"}
+)
 VALID_SEVERITIES = frozenset(SEVERITY_MAP.keys())
 VALID_TASK_IDS = frozenset({"easy", "medium", "hard"})
 
@@ -80,58 +82,97 @@ class BugTriageEnvironment:
             done=False,
         )
 
-    def step(self, action: BugAction) -> BugObservation:
-        """Process one triage action, compute reward, advance to next issue."""
+    def step(self, action: BugAction) -> BugStepResult:
+        """Process one triage action, compute reward, advance to next issue.
+
+        Returns BugStepResult with (observation, reward, done, info) per OpenEnv spec.
+        """
         if not self._initialized:
             self.reset("easy")
 
         self._state.step_count += 1
+        step_reward: float = 0.0
+        info: Dict = {}
+        last_result: str = ""
 
         # Validate action_type
         if action.action_type not in VALID_LABELS:
-            return self._apply_penalty(
-                PENALTY_INVALID_ACTION,
+            last_result = (
                 f"Invalid action_type '{action.action_type}'. "
-                f"Must be one of: {sorted(VALID_LABELS)}. Penalized.",
+                f"Must be one of: {sorted(VALID_LABELS)}. Penalized."
+            )
+            self._cumulative_score = max(0.0, self._cumulative_score + PENALTY_INVALID_ACTION)
+            step_reward = max(0.0, PENALTY_INVALID_ACTION)
+            info = {"last_action_result": last_result, "step_count": self._state.step_count}
+            return BugStepResult(
+                observation=self._build_observation(last_action_result=last_result, done=False),
+                reward=step_reward,
+                done=False,
+                info=info,
             )
 
         # Validate severity
         if action.severity not in VALID_SEVERITIES:
-            return self._apply_penalty(
-                PENALTY_INVALID_SEVERITY,
-                f"Invalid severity '{action.severity}'. "
-                f"Must be one of: P0, P1, P2, P3. Penalized.",
+            last_result = (
+                f"Invalid severity '{action.severity}'. Must be one of: P0, P1, P2, P3. Penalized."
+            )
+            self._cumulative_score = max(0.0, self._cumulative_score + PENALTY_INVALID_SEVERITY)
+            step_reward = max(0.0, PENALTY_INVALID_SEVERITY)
+            info = {"last_action_result": last_result, "step_count": self._state.step_count}
+            return BugStepResult(
+                observation=self._build_observation(last_action_result=last_result, done=False),
+                reward=step_reward,
+                done=False,
+                info=info,
             )
 
         # Validate issue_id matches current issue
         current = self._current_issue()
         if action.issue_id != current["issue_id"]:
-            return self._apply_penalty(
-                PENALTY_WRONG_ISSUE_ID,
+            last_result = (
                 f"Wrong issue_id '{action.issue_id}'. "
-                f"Current issue is '{current['issue_id']}'. Penalized.",
+                f"Current issue is '{current['issue_id']}'. Penalized."
+            )
+            self._cumulative_score = max(0.0, self._cumulative_score + PENALTY_WRONG_ISSUE_ID)
+            step_reward = max(0.0, PENALTY_WRONG_ISSUE_ID)
+            info = {"last_action_result": last_result, "step_count": self._state.step_count}
+            return BugStepResult(
+                observation=self._build_observation(last_action_result=last_result, done=False),
+                reward=step_reward,
+                done=False,
+                info=info,
             )
 
         # Evaluate action against ground truth
         reward, result = self._evaluate_action(action, current)
 
         # Record for graders
-        self._triaged.append({
-            "issue_id": action.issue_id,
-            "action": action.action_type,
-            "severity": action.severity,
-            "duplicate_of": action.duplicate_of,
-            "reasoning": action.reasoning,
-            "reward": reward,
-            "correct_label": current["_correct_label"],
-            "correct_severity": current["_correct_severity"],
-        })
+        self._triaged.append(
+            {
+                "issue_id": action.issue_id,
+                "action": action.action_type,
+                "severity": action.severity,
+                "duplicate_of": action.duplicate_of,
+                "reasoning": action.reasoning,
+                "reward": reward,
+                "correct_label": current["_correct_label"],
+                "correct_severity": current["_correct_severity"],
+            }
+        )
 
         self._cumulative_score = max(0.0, self._cumulative_score + reward)
         self._current_index += 1
 
         done = self._current_index >= len(self._inbox)
-        return self._build_observation(last_action_result=result, done=done)
+        step_reward = round(max(0.0, min(1.0, reward)), 3)
+        info = {"last_action_result": result, "step_count": self._state.step_count}
+
+        return BugStepResult(
+            observation=self._build_observation(last_action_result=result, done=done),
+            reward=step_reward,
+            done=done,
+            info=info,
+        )
 
     @property
     def state(self) -> EpisodeState:
@@ -155,9 +196,7 @@ class BugTriageEnvironment:
         idx = min(self._current_index, len(self._inbox) - 1)
         return self._inbox[idx]
 
-    def _evaluate_action(
-        self, action: BugAction, issue: Dict
-    ) -> Tuple[float, str]:
+    def _evaluate_action(self, action: BugAction, issue: Dict) -> Tuple[float, str]:
         """Compare agent action to ground truth. Returns (reward, feedback)."""
         correct_label = issue["_correct_label"]
         correct_severity = issue["_correct_severity"]
@@ -187,7 +226,9 @@ class BugTriageEnvironment:
                 f"expected '{correct_severity}' (+0.15 partial)"
             )
         else:
-            notes.append(f"Severity far off: got '{action.severity}', expected '{correct_severity}'")
+            notes.append(
+                f"Severity far off: got '{action.severity}', expected '{correct_severity}'"
+            )
 
         # Duplicate reference bonus (10%)
         if correct_label == "label_duplicate" and action.action_type == "label_duplicate":

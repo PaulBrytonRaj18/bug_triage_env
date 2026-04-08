@@ -21,7 +21,7 @@ import pytest
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _ROOT)
 
-from models import BugAction, BugObservation
+from models import BugAction, BugObservation, BugStepResult
 from issue_generator import generate_inbox, strip_ground_truth
 from server.environment import BugTriageEnvironment, EpisodeState
 from graders import grade_easy, grade_medium, grade_hard, TASK_REGISTRY
@@ -30,6 +30,7 @@ from graders import grade_easy, grade_medium, grade_hard, TASK_REGISTRY
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def env():
@@ -52,8 +53,9 @@ def hard_inbox():
     return generate_inbox("hard")
 
 
-def make_action(issue_id: str, label: str = "label_bug", severity: str = "P1",
-                duplicate_of: str = None) -> BugAction:
+def make_action(
+    issue_id: str, label: str = "label_bug", severity: str = "P1", duplicate_of: str = None
+) -> BugAction:
     """Helper to build a BugAction quickly."""
     return BugAction(
         action_type=label,
@@ -79,8 +81,8 @@ def perfect_action(issue: dict) -> BugAction:
 # RESET TESTS
 # ===========================================================================
 
-class TestReset:
 
+class TestReset:
     def test_reset_easy_returns_observation(self, env):
         obs = env.reset("easy")
         assert isinstance(obs, BugObservation)
@@ -133,8 +135,8 @@ class TestReset:
 # STEP TESTS
 # ===========================================================================
 
-class TestStep:
 
+class TestStep:
     def test_step_correct_label_and_severity_gives_full_reward(self, env):
         inbox = generate_inbox("easy")
         env.reset("easy")
@@ -233,8 +235,12 @@ class TestStep:
 
         # Find first P0 bug
         p0_issue = next(
-            (i for i in inbox if i["_correct_severity"] == "P0" and i["_correct_label"] == "label_bug"),
-            None
+            (
+                i
+                for i in inbox
+                if i["_correct_severity"] == "P0" and i["_correct_label"] == "label_bug"
+            ),
+            None,
         )
         if p0_issue is None:
             pytest.skip("No P0 bug in easy inbox")
@@ -270,13 +276,74 @@ class TestStep:
         obs = env.step(action)
         assert obs is not None
 
+    def test_step_returns_bugstepresult(self, env):
+        """step() must return BugStepResult (not just BugObservation)."""
+        env.reset("easy")
+        action = make_action("ISS-1000", "label_bug", "P1")
+        result = env.step(action)
+        assert isinstance(result, BugStepResult), f"Expected BugStepResult, got {type(result)}"
+
+    def test_step_bugstepresult_has_all_required_fields(self, env):
+        """BugStepResult must have observation, reward, done, info."""
+        env.reset("easy")
+        action = make_action("ISS-1000", "label_bug", "P1")
+        result = env.step(action)
+        assert hasattr(result, "observation")
+        assert hasattr(result, "reward")
+        assert hasattr(result, "done")
+        assert hasattr(result, "info")
+        assert isinstance(result.observation, BugObservation)
+        assert isinstance(result.reward, float)
+        assert isinstance(result.done, bool)
+        assert isinstance(result.info, dict)
+
+    def test_step_reward_in_valid_range(self, env):
+        """Step reward must be in [0.0, 1.0]."""
+        env.reset("easy")
+        action = make_action("ISS-1000", "label_bug", "P1")
+        result = env.step(action)
+        assert 0.0 <= result.reward <= 1.0
+
+    def test_step_done_true_only_at_end(self, env):
+        """done=True only when all issues are triaged."""
+        inbox = generate_inbox("easy")
+        env.reset("easy")
+        for i, issue in enumerate(inbox[:-1]):
+            result = env.step(perfect_action(issue))
+            assert result.done is False, f"done=True at step {i + 1}, expected False"
+        last_result = env.step(perfect_action(inbox[-1]))
+        assert last_result.done is True
+
+    def test_step_info_contains_debug_metadata(self, env):
+        """info dict should contain last_action_result and step_count."""
+        env.reset("easy")
+        inbox = generate_inbox("easy")
+        result = env.step(perfect_action(inbox[0]))
+        assert "last_action_result" in result.info
+        assert "step_count" in result.info
+        assert result.info["step_count"] == 1
+
+    def test_step_observation_matches_old_interface(self, env):
+        """BugStepResult supports obs.issue_id style access for backward compat.
+
+        After stepping, the observation shows the NEXT issue to be triaged.
+        result.issue_id should delegate to result.observation.issue_id.
+        """
+        inbox = generate_inbox("easy")
+        env.reset("easy")
+        result = env.step(perfect_action(inbox[0]))
+        assert result.issue_id == inbox[1]["issue_id"]
+        assert result.title == inbox[1]["title"]
+        assert result.cumulative_score >= 0.0
+        assert result.done is False
+
 
 # ===========================================================================
 # GROUND TRUTH ISOLATION TESTS
 # ===========================================================================
 
-class TestGroundTruthIsolation:
 
+class TestGroundTruthIsolation:
     def test_observation_has_no_private_fields(self, env):
         obs = env.reset("hard")
         d = obs.model_dump()
@@ -310,8 +377,8 @@ class TestGroundTruthIsolation:
 # FULL EPISODE TESTS
 # ===========================================================================
 
-class TestFullEpisode:
 
+class TestFullEpisode:
     def _run_perfect_episode(self, env, task_id):
         inbox = generate_inbox(task_id)
         env.reset(task_id)
@@ -346,8 +413,8 @@ class TestFullEpisode:
 # GRADER TESTS
 # ===========================================================================
 
-class TestGraders:
 
+class TestGraders:
     def _perfect_actions(self, task_id: str):
         inbox = generate_inbox(task_id)
         return [
@@ -391,19 +458,23 @@ class TestGraders:
         actions = []
         for i, issue in enumerate(inbox):
             if i % 2 == 0:
-                actions.append({
-                    "issue_id": issue["issue_id"],
-                    "action": issue["_correct_label"],
-                    "severity": issue["_correct_severity"],
-                    "duplicate_of": issue.get("_duplicate_of"),
-                })
+                actions.append(
+                    {
+                        "issue_id": issue["issue_id"],
+                        "action": issue["_correct_label"],
+                        "severity": issue["_correct_severity"],
+                        "duplicate_of": issue.get("_duplicate_of"),
+                    }
+                )
             else:
-                actions.append({
-                    "issue_id": issue["issue_id"],
-                    "action": "label_invalid",
-                    "severity": "P3",
-                    "duplicate_of": None,
-                })
+                actions.append(
+                    {
+                        "issue_id": issue["issue_id"],
+                        "action": "label_invalid",
+                        "severity": "P3",
+                        "duplicate_of": None,
+                    }
+                )
         score = grade_easy(actions)
         assert 0.35 <= score <= 0.70  # alternating correct/wrong on 8 issues
 
@@ -426,19 +497,23 @@ class TestGraders:
         for issue in inbox:
             if issue["_correct_label"] == "label_duplicate":
                 # Correct label but wrong reference
-                actions.append({
-                    "issue_id": issue["issue_id"],
-                    "action": "label_duplicate",
-                    "severity": issue["_correct_severity"],
-                    "duplicate_of": "ISS-9999",  # wrong reference
-                })
+                actions.append(
+                    {
+                        "issue_id": issue["issue_id"],
+                        "action": "label_duplicate",
+                        "severity": issue["_correct_severity"],
+                        "duplicate_of": "ISS-9999",  # wrong reference
+                    }
+                )
             else:
-                actions.append({
-                    "issue_id": issue["issue_id"],
-                    "action": issue["_correct_label"],
-                    "severity": issue["_correct_severity"],
-                    "duplicate_of": None,
-                })
+                actions.append(
+                    {
+                        "issue_id": issue["issue_id"],
+                        "action": issue["_correct_label"],
+                        "severity": issue["_correct_severity"],
+                        "duplicate_of": None,
+                    }
+                )
         score = grade_medium(actions)
         # All labels correct (1.0 * 0.7) + dup detection 0 (0 * 0.3) = 0.7
         assert 0.65 <= score <= 0.75
@@ -462,19 +537,23 @@ class TestGraders:
         actions = []
         for issue in inbox:
             if issue["_correct_label"] == "label_bug" and issue["_correct_severity"] == "P0":
-                actions.append({
-                    "issue_id": issue["issue_id"],
-                    "action": "label_feature",  # miss the P0 bug
-                    "severity": "P3",
-                    "duplicate_of": None,
-                })
+                actions.append(
+                    {
+                        "issue_id": issue["issue_id"],
+                        "action": "label_feature",  # miss the P0 bug
+                        "severity": "P3",
+                        "duplicate_of": None,
+                    }
+                )
             else:
-                actions.append({
-                    "issue_id": issue["issue_id"],
-                    "action": issue["_correct_label"],
-                    "severity": issue["_correct_severity"],
-                    "duplicate_of": issue.get("_duplicate_of"),
-                })
+                actions.append(
+                    {
+                        "issue_id": issue["issue_id"],
+                        "action": issue["_correct_label"],
+                        "severity": issue["_correct_severity"],
+                        "duplicate_of": issue.get("_duplicate_of"),
+                    }
+                )
         score_with_misses = grade_hard(actions)
         perfect_score = grade_hard(self._perfect_actions("hard"))
         assert score_with_misses < perfect_score
@@ -500,8 +579,12 @@ class TestGraders:
 
             # All wrong
             wrong = [
-                {"issue_id": i["issue_id"], "action": "label_invalid",
-                 "severity": "P3", "duplicate_of": None}
+                {
+                    "issue_id": i["issue_id"],
+                    "action": "label_invalid",
+                    "severity": "P3",
+                    "duplicate_of": None,
+                }
                 for i in inbox
             ]
             scores.add(grader_fn(wrong))
@@ -510,19 +593,23 @@ class TestGraders:
             half = []
             for j, issue in enumerate(inbox):
                 if j < len(inbox) // 2:
-                    half.append({
-                        "issue_id": issue["issue_id"],
-                        "action": issue["_correct_label"],
-                        "severity": issue["_correct_severity"],
-                        "duplicate_of": issue.get("_duplicate_of"),
-                    })
+                    half.append(
+                        {
+                            "issue_id": issue["issue_id"],
+                            "action": issue["_correct_label"],
+                            "severity": issue["_correct_severity"],
+                            "duplicate_of": issue.get("_duplicate_of"),
+                        }
+                    )
                 else:
-                    half.append({
-                        "issue_id": issue["issue_id"],
-                        "action": "label_invalid",
-                        "severity": "P3",
-                        "duplicate_of": None,
-                    })
+                    half.append(
+                        {
+                            "issue_id": issue["issue_id"],
+                            "action": "label_invalid",
+                            "severity": "P3",
+                            "duplicate_of": None,
+                        }
+                    )
             scores.add(grader_fn(half))
 
             # All perfect
@@ -579,8 +666,8 @@ class TestGraders:
 # STATE TESTS
 # ===========================================================================
 
-class TestEpisodeState:
 
+class TestEpisodeState:
     def test_state_has_episode_id(self, env):
         env.reset("easy")
         assert len(env.state.episode_id) > 0

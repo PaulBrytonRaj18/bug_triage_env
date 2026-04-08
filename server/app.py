@@ -11,7 +11,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from models import BugAction, BugObservation
+from models import BugAction, BugObservation, BugStepResult
 from server.environment import BugTriageEnvironment, VALID_TASK_IDS
 
 app = FastAPI(
@@ -99,9 +99,9 @@ async def reset(body: ResetRequest) -> BugObservation:
         raise HTTPException(status_code=422, detail=str(exc))
 
 
-@app.post("/step", response_model=BugObservation, tags=["OpenEnv"])
-async def step(body: StepRequest) -> BugObservation:
-    """Submit a triage action. Returns the next issue."""
+@app.post("/step", response_model=BugStepResult, tags=["OpenEnv"])
+async def step(body: StepRequest) -> BugStepResult:
+    """Submit a triage action. Returns observation, reward, done, info per OpenEnv spec."""
     action = BugAction(
         action_type=body.action_type,
         severity=body.severity,
@@ -115,4 +115,4 @@ async def step(body: StepRequest) -> BugObservation:
 @app.get("/state", tags=["OpenEnv"])
 async def state() -> Dict[str, Any]:
     """Return current episode metadata."""
-    return env.state
+    return env.state.to_dict()
