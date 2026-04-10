@@ -1,3 +1,12 @@
+---
+title: Bug Triage Env
+emoji: 🐛
+colorFrom: purple
+colorTo: blue
+sdk: docker
+pinned: false
+---
+
 # Bug Triage Env
 
 An OpenEnv-compliant reinforcement learning environment that simulates the real-world
